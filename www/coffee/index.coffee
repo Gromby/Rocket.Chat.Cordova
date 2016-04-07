@@ -3,14 +3,40 @@ Bugsnag.metaData =
 	platformVersion: cordova.platformVersion
 	deviceVersion: window.device?.version
 
-AUTOLOAD = true
+window.AUTOLOAD = true
+
+window.updateQuickActions = ->
+	ThreeDeeTouch.isAvailable (avail) ->
+		if avail isnt true
+			return
+
+		ThreeDeeTouch.enableLinkPreview()
+
+		actions = []
+
+		for server in Servers.getServers()
+			actions.push
+				type: server.url
+				title: server.name
+				iconType: 'Home'
+
+		ThreeDeeTouch.configureQuickActions(actions)
+
 
 HOME_URL = 'http://gromby.com'
 
 window.registerServer = (serverAddress) ->
 
+	if not /(^https?:\/\/)|(\.)|(^localhost(:\d+)?$)/.test serverAddress
+		serverAddress = 'https://' + serverAddress + '.rocket.chat'
+
 	if not /^https?:\/\/.+/.test serverAddress
-		serverAddress = 'http://' + serverAddress
+		if /^((localhost)|([0-9.]+))(:\d+)?$/.test serverAddress
+			serverAddress = 'http://' + serverAddress
+		else
+			serverAddress = 'https://' + serverAddress
+
+	$('#serverAddress').val(serverAddress);
 
 	name = serverAddress.replace(/https?:\/\//, '').replace(/^www\./, '')
 
@@ -32,11 +58,12 @@ window.registerServer = (serverAddress) ->
 				, 1500
 
 			refreshServerList()
+			window.updateQuickActions()
 
 			$('.loading-text').text cordovai18n("Downloading_files")
 			Servers.downloadServer serverAddress, (status) ->
 				if status.done is true
-					$('.loading-text').text cordovai18n("Loading_s", serverAddress)
+					$('.loading-text').text cordovai18n("Loading_s", name)
 					Servers.save ->
 						Servers.startServer serverAddress, ->
 							#
@@ -114,7 +141,7 @@ window.configurePush = ->
 		if Servers.serverExists(host) isnt true
 			return
 
-		AUTOLOAD = false
+		window.AUTOLOAD = false
 
 		if not data.additionalData.ejson?.rid?
 			return
@@ -129,6 +156,7 @@ window.configurePush = ->
 			when 'd'
 				path = 'direct/' + data.additionalData.ejson.sender.username
 
+		navigator.splashscreen.hide()
 		Servers.startServer host, path, (err, url) ->
 			if err?
 				# TODO err
@@ -172,7 +200,7 @@ document.addEventListener "deviceready", ->
 		e.stopPropagation()
 		cordova.plugins.Keyboard.close()
 		setTimeout ->
-			loadLastActiveServer() if AUTOLOAD is true
+			loadLastActiveServer() if window.AUTOLOAD is true
 		, 200
 
 	$('.server-list-info').on 'click', (e) ->
@@ -184,8 +212,8 @@ document.addEventListener "deviceready", ->
 	Servers.onLoad ->
 		configurePush()
 		refreshServerList()
-		navigator.splashscreen.hide()
 		if query.updateServer?
+			navigator.splashscreen.hide()
 			return updateServer(decodeURIComponent(query.updateServer), decodeURIComponent(query.version))
 
 		$('.server-enter').removeClass 'hidden'

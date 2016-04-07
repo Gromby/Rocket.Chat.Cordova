@@ -3,6 +3,7 @@
 var execSync = require('child_process').execSync;
 var fs = require('fs');
 var request = require('request');
+var async = require('async');
 
 execSync("rm -rf www/cache/*");
 
@@ -22,27 +23,38 @@ request(server+'/__cordova/manifest.json', function (error, response, body) {
 
 	fs.writeFileSync('www/js/cache_manifest.js', 'window.cacheManifest = '+JSON.stringify(manifest), 'utf8');
 
-	manifest.manifest.forEach(function(item) {
+	async.eachLimit(manifest.manifest, 5, function(item, callback) {
 		if (!item.url) {
-			return;
+			return callback();
+		}
+
+		if (item.url.indexOf('/packages/rocketchat_livechat/') > -1) {
+			return callback();
 		}
 
 		var url = server + '/__cordova' + item.url;
 		var path = item.url.replace(/\?.+$/, '').split('/');
 		var name = path.pop();
+
 		path = path.join('/');
 		var dest = 'www/cache' + path;
 
 		request({url: url, encoding: null}, function (error, response, body) {
 			if (error) {
+				callback();
 				return console.log(url, error);
 			}
 			if (response.statusCode !== 200) {
+				callback();
 				return console.log(url, response.statusCode);
 			}
 
 			execSync("mkdir -p "+dest);
+			console.log(dest+'/'+name);
 			fs.writeFileSync(dest+'/'+name, body);
+			callback();
 		});
+	}, function done() {
+		console.log('done');
 	});
 });
