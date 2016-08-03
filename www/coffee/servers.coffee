@@ -54,7 +54,7 @@ window.Servers = new class
 				message: cordovai18n("The_address_provided_must_be_a_string")
 				url: url
 
-		url = url.trim().toLowerCase()
+		url = url.trim()
 		url - url.replace /\/$/, ''
 
 		if _.isEmpty(url)
@@ -71,10 +71,15 @@ window.Servers = new class
 				message: cordovai18n("The_address_must_start_with_http_or_https")
 				url: url
 
+		atIndex = url.indexOf '@'
+		auth = null
+		if atIndex != -1
+			auth = url.split('@')[0].split(':')[2]
 		return {} =
 			isValid: true
 			message: cordovai18n("The_address_provided_is_valid")
 			url: url
+			auth: auth
 
 
 	validateName: (name) ->
@@ -100,8 +105,14 @@ window.Servers = new class
 			name: name
 
 
-	validateServer: (url, cb) ->
-		request = $.getJSON "#{url}/api/info"
+	validateServer: (url, auth, cb) ->
+		headers = {}
+		if auth
+			headers.Authorization = "Bearer " + auth
+		request = $.ajax
+			dataType: "json"
+			url: "#{url}/api/info"
+			headers: headers
 
 		timeout = setTimeout ->
 			request.abort()
@@ -127,6 +138,7 @@ window.Servers = new class
 		request.fail (jqxhr, textStatus, error) ->
 			if error?.name is "SyntaxError"
 				return cb cordovai18n("The_server_s_is_running_an_out_of_date_version_Please_ask_your_server_admin_to_update_to_a_new_version_of_RocketChat", url)
+			console.log "req failed: #{textStatus}, #{error}, #{request.status}"
 			cb cordovai18n("Failed_to_connect_to_server_s_s", textStatus, error)
 
 
@@ -140,11 +152,17 @@ window.Servers = new class
 		if urlObj.isValid is false
 			return cb urlObj.message
 
-		@validateServer urlObj.url, (err, data) =>
+		@validateServer urlObj.url, urlObj.auth, (err, data) =>
 			if err?
 				return cb err
 
-			request = $.getJSON "#{urlObj.url}/__cordova/manifest.json"
+			headers = {}
+			if urlObj.auth
+				headers.Authorization = "Bearer " + urlObj.auth
+			request = $.ajax
+				dataType: "json"
+				url: "#{urlObj.url}/__cordova/manifest.json"
+				headers: headers
 
 			timeout = setTimeout ->
 				request.abort()
@@ -199,10 +217,15 @@ window.Servers = new class
 				return cb err
 
 			if servers[url].info.version isnt info.version
+				oldInfo = servers[url].oldInfo
 				servers[url].oldInfo = servers[url].info
 				servers[url].info = info
 
-				@downloadServer url, cb
+				@downloadServer url, (status) ->
+					if status?.err?
+						servers[url].info = servers[url].oldInfo
+						servers[url].oldInfo = oldInfo
+					cb(status)
 
 
 	getFileTransfer: ->
@@ -215,10 +238,20 @@ window.Servers = new class
 
 
 	baseUrlToDir: (baseUrl) ->
-		return encodeURIComponent baseUrl.replace(/[\s\.\\\/:]/g, '')
+		return encodeURIComponent baseUrl.toLowerCase().replace(/[\s\.\\\/:@\-]/g, '')
 
 
 	downloadServer: (url, downloadServerCb) ->
+		copyDownloadedFiles = (copyDownloadedFilesCb) =>
+			items = servers[url].info.manifest.filter (item) ->
+				return item.copied is false
+
+			copy = (item, cb) =>
+				copyFile 'file://'+item.copyFrom, item.copyTo, cb
+
+			async.each items, copy, (err) ->
+				copyDownloadedFilesCb()
+
 		initDownloadServer = =>
 			i = 0
 			items = servers[url].info.manifest.filter (item) ->
@@ -233,11 +266,20 @@ window.Servers = new class
 
 				@downloadFile url, item.url.replace(/\?.+$/, ''), (err, data) ->
 					item.downloaded = err is undefined
+					if data?
+						item.copied = false
+						item.copyFrom = data.from
+						item.copyTo = data.to
+
 					downloadServerCb?({done: false, count: ++i, total: items.length})
 					cb(err, data)
 
-			async.eachLimit items, 5, download, ->
-				downloadServerCb?({done: true})
+			async.eachLimit items, 5, download, (err) ->
+				if err?
+					downloadServerCb?({err: err})
+				else
+					copyDownloadedFiles =>
+						downloadServerCb?({done: true, count: items.length, total: items.length})
 
 
 		filesToCopy = 0
@@ -287,11 +329,32 @@ window.Servers = new class
 			initDownloadServer()
 
 
-	fixIndexFile: (indexDir, cb) ->
+	fixIndexFile: (indexDir, baseUrl, cb) ->
+		urlObj = @validateUrl baseUrl
 		readFile indexDir, "index.html", (err, file) =>
 			file = file.replace(/<script text="text\/javascript" src="\/shared\/.+\n/gm, '')
 			file = file.replace(/<link rel="stylesheet" href="\/shared\/.+\n/gm, '')
 
+			if urlObj.auth
+				schemalessUrl = baseUrl.replace('http://', '').replace('https://', '')
+				file = file.replace(/(^\s*__meteor_runtime_config__ = JSON.+$)/gm, """
+					/* sandstorm workaround */ $1
+				__meteor_runtime_config__.ROOT_URL = '#{baseUrl}';
+				__meteor_runtime_config__.DDP_DEFAULT_CONNECTION_URL = '#{baseUrl}';
+				__meteor_runtime_config__.SANDSTORM_API_TOKEN = '#{urlObj.auth}';
+				__meteor_runtime_config__.SANDSTORM_API_HOST = '#{baseUrl}';
+
+				window._OriginalWebSocket = window._OriginalWebSocket || window.WebSocket;
+				window.WebSocket = function SandstormWebSocket (url, protocols) {
+					url = url.replace('#{schemalessUrl}',
+					"#{schemalessUrl}/.sandstorm-token/#{urlObj.auth}");
+					if (protocols) {
+						return new _OriginalWebSocket(url, protocols);
+					} else {
+						return new _OriginalWebSocket(url);
+					}
+				};
+				""")
 			file = file.replace /(<\/head>)/gm, """
 				<link rel="stylesheet" href="/shared/css/servers-list.css"/>
 				<script text="text/javascript" src="/shared/js/android_sender_id.js"></script>
@@ -310,18 +373,31 @@ window.Servers = new class
 		ft = @getFileTransfer()
 		attempts = 0
 
+		urlObj = @validateUrl baseUrl
+		strippedUrl = baseUrl
+		# urls with http basic auth seem to cause problems with cordova's download file
+		if urlObj.auth
+			if baseUrl
+				strippedUrl = baseUrl.replace("sandstorm:#{urlObj.auth}@".toLowerCase(), '')
+			if path
+				path = path.replace("sandstorm:#{urlObj.auth}@".toLowerCase(), '')
+
 		tryDownload = =>
 			attempts++
 
-			url = encodeURI "#{baseUrl}/__cordova#{path}?#{@random()}"
-			pathToSave = @uriToPath(cordova.file.dataDirectory) + @baseUrlToDir(baseUrl) + '/' + encodeURI(path)
+			url = encodeURI "#{strippedUrl}/__cordova#{path}?#{@random()}"
+			pathToSave = @uriToPath(cordova.file.dataDirectory) + @baseUrlToDir(baseUrl) + '_temp' + encodeURI(path)
+			pathToSaveFinal = @uriToPath(cordova.file.dataDirectory) + @baseUrlToDir(baseUrl) + encodeURI(path)
 
 			# console.log "start downloading", url, ', saving at', pathToSave
 
 			downloadSuccess = (entry) =>
 				if entry?
 					console.log("done downloading " + path)
-					cb null, entry
+					cb null, {
+						from: pathToSave
+						to: @baseUrlToDir(baseUrl) + encodeURI(path)
+					}
 
 			downloadError = (err) =>
 				if attempts < 5
@@ -329,9 +405,14 @@ window.Servers = new class
 					return tryDownload()
 
 				console.log('downloadFile err', err)
-				cb null, err
+				cb err, null
 
-			ft.download url, pathToSave, downloadSuccess, downloadError, true
+			headers = {}
+			if urlObj.auth
+				headers.Authorization = "Bearer " + urlObj.auth
+			ft.download url, pathToSave, downloadSuccess, downloadError, true, {
+	        headers: headers
+		    }
 
 		tryDownload()
 
@@ -419,7 +500,7 @@ window.Servers = new class
 			cb? error
 			console.log 'failed to start server:', error
 
-		@fixIndexFile cordova.file.dataDirectory + @baseUrlToDir(baseUrl), ->
+		@fixIndexFile cordova.file.dataDirectory + @baseUrlToDir(baseUrl), baseUrl, ->
 			httpd.startServer options, success, failure
 
 
