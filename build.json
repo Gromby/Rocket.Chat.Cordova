@@ -17,6 +17,13 @@
             "alias": "Gromby",
             "password" : "",
             "keystoreType": ""
+        },
+        "debug": {
+            "keystore": "androiddebug.keystore",
+            "storePassword": "darlingjr",
+            "alias": "DEBUG",
+            "password": "darlingjr",
+            "keystoreType": ""
         }
     }
 }
